@@ -1,0 +1,527 @@
+import json
+import re
+import socketio
+from fastapi import APIRouter, Request
+import httpx
+from src.features.ai.agents.custom_agent_service import logger
+from openai import AsyncOpenAI
+import os
+import chromadb
+from supabase import create_client, Client
+from dotenv import load_dotenv
+from collections import defaultdict
+import asyncio
+import traceback
+
+router = APIRouter()
+
+load_dotenv()
+
+client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+if not SUPABASE_URL or not SUPABASE_KEY:
+    print("❌ Supabase credentials not configured properly")
+    supabase: Client = None
+else:
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    print("✅ Supabase connected successfully")
+
+
+PERSIST_DIRECTORY = os.path.join(os.getcwd(), "chroma_data")
+chroma_client = chromadb.PersistentClient(path=PERSIST_DIRECTORY)
+
+GHL_SEND_MESSAGE_ENDPOINT = ("https://services.leadconnectorhq.com/conversations/messages")
+GHL_GET_MESSAGE_ENDPOINT = "https://services.leadconnectorhq.com/conversations/messages"
+
+# Buffer messages per contact_id (list of message texts)
+_pending_messages: dict = defaultdict(list)
+
+# Store latest phone and latest tag per contact (so we can use them when replying)
+_latest_phone: dict = {}
+_latest_tag: dict = {}
+
+# Active asyncio.Task per contact for the debounce timer
+_active_tasks: dict = {}
+
+# Debounce delay in seconds
+DEBOUNCE_SECONDS = 10
+
+# Create Socket.IO server
+sio_server = socketio.AsyncServer(
+    async_mode="asgi",
+    cors_allowed_origins="*",
+    # cors_allowed_origins=[],
+)
+
+# Create ASGI app for Socket.IO
+sio_app = socketio.ASGIApp(
+    socketio_server=sio_server,
+    socketio_path="sockets",
+)
+
+# ✅ Store userId → socketId mapping
+connected_clients = {}
+
+
+@sio_server.event
+async def connect(sid, environ):
+    query = environ.get("QUERY_STRING", "")
+    params = dict(pair.split("=") for pair in query.split("&") if "=" in pair)
+    user_id = params.get("userId")
+
+    if user_id:
+        connected_clients[user_id] = sid
+        logger.info(f"✅ Auto-registered user {user_id} on connect with socket {sid}")
+    else:
+        print(f"⚠️ No userId in connect query for socket {sid}")
+
+
+@sio_server.event
+async def disconnect(sid):
+    for user_id, s in list(connected_clients.items()):
+        if s == sid:
+            del connected_clients[user_id]
+            print(f"❌ {user_id} disconnected — removed from connected_clients")
+            break
+
+
+@sio_server.event
+async def chat_message(sid, data):
+
+    payload = {
+        "contactId": data["contactId"],
+        "phone": data["phone"],
+        "message": data["message"],
+        "type": data["type"],
+    }
+
+    headers = {
+        "Authorization": f"Bearer {data['token']}",
+        "Content-Type": "application/json",
+        "Version": "2021-04-15",
+    }
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        # 1. Send message
+        response = await client.post(
+            GHL_SEND_MESSAGE_ENDPOINT, headers=headers, json=payload
+        )
+        response.raise_for_status()
+        ghl_response = response.json()
+
+    # 2. Extract messageId
+    message_id = ghl_response.get("id") or ghl_response.get("messageId")
+    if not message_id:
+        print("⚠️ No messageId found in GHL response:", ghl_response)
+        await sio_server.emit("new_message", ghl_response, room=sid)
+        return
+
+    # 3. Fetch single message (new async client context!)
+    async with httpx.AsyncClient(timeout=10) as client:
+        url = f"{GHL_GET_MESSAGE_ENDPOINT}/{message_id}"
+
+        response = await client.get(url, headers=headers)
+        response.raise_for_status()
+        ghl_get_response = response.json()
+
+    # 4️⃣ Inject phone number for frontend consistency
+    ghl_get_response["phone"] = payload["phone"]
+
+    print("ghl_get_response ======> ", ghl_get_response)
+
+    # 4. Emit the fetched message
+    await sio_server.emit("new_message", ghl_get_response, room=sid)
+
+
+# ----- Webhook endpoint (GHL) -----
+# @router.post("/webhooks/ghl/message")
+@router.post("/test-ghl")
+async def ghl_webhook(request: Request):
+    try:
+        # print("\n🚀 [Webhook] GHL message received")
+
+        # --- 1️⃣ Parse the body ---
+        body_bytes = await request.body()
+        if not body_bytes:
+            # print("⚠️ [Webhook] Empty request body — ignoring")
+            return {"status": "ok", "message": "Empty request ignored"}
+
+        body = await request.json()
+        # print(f"📩 [Webhook] Raw GHL payload:\n{json.dumps(body, indent=2)}")
+
+        # --- 2️⃣ Extract core fields ---
+        contact_id = body.get("contact_id")
+        phone = body.get("phone")
+        ghl_tag = body.get("tags")
+        location_id = body.get("location", {}).get("id")
+        message_obj = body.get("message", {}) or {}
+        message_text = message_obj.get("body")
+        message_type = message_obj.get("type")
+
+        # Map message type → channel (19 = WhatsApp, others = SMS)
+        if message_type == 19:
+            incoming_channel = "WhatsApp"
+        else:
+            incoming_channel = "SMS"
+
+        # print(
+        #     f"🧩 [Extracted] contact_id={contact_id}, phone={phone}, tag={ghl_tag}, message={message_text}"
+        # )
+
+        if not phone or not message_text:
+            # print("⚠️ [Webhook] Missing phone or message_text — skipping processing")
+            return {"status": "ok", "message": "Missing phone or message_text"}
+
+        standardized_payload = {
+            "contactId": contact_id,
+            "phone": phone,
+            "message": message_text,
+            "type": message_type,
+        }
+
+        # --- 2️⃣ Emit new incoming message to frontend (unchanged — immediate) ---
+        await sio_server.emit("new_message", standardized_payload)
+        # print(
+        #     f"📤 [Emit] Forwarded incoming message to frontend → {standardized_payload}"
+        # )
+
+        # ----- Debounce buffering logic (NEW) -----
+        # Append message_text into pending buffer
+        _pending_messages[contact_id].append(message_text)
+
+        # Save user message in Supabase
+        supabase.table("messages").insert(
+            {
+                "contact_id": contact_id,
+                "role": "user",
+                "content": message_text,
+            }
+        ).execute()
+
+        # Keep latest phone and tag for when we process
+        _latest_phone[contact_id] = phone
+        _latest_tag[contact_id] = ghl_tag
+
+        # If there's an existing active debounce task for this contact, cancel it
+        existing_task = _active_tasks.get(contact_id)
+
+
+        if existing_task and not existing_task.done():
+            try:
+                existing_task.cancel()
+                # print(
+                #     f"🔁 [Debounce] Cancelled existing debounce task for {contact_id}"
+                # )
+            except Exception as e:
+                print(f"⚠️ [Debounce] Error cancelling task for {contact_id}: {e}")
+
+        # Start a new debounce task
+        task = asyncio.create_task(
+            _debounced_process(contact_id, location_id, incoming_channel)
+        )
+        _active_tasks[contact_id] = task
+        print(
+            f"⏱️ [Debounce] Started debounce task for {contact_id} (waiting {DEBOUNCE_SECONDS}s)"
+        )
+
+        # Return immediately — processing happens in background task
+        return {"status": "ok", "message": "Received and buffered"}
+
+    except Exception as e:
+        # print("❌ [ERROR] ghl_webhook:", str(e))
+
+        # print(traceback.format_exc())
+        return {"status": "error", "message": str(e)}
+
+
+# ----- Debounce worker -----
+async def _debounced_process(contact_id: str, location_id: str, incoming_channel: str):
+    """
+    Waits DEBOUNCE_SECONDS since last schedule, then processes all buffered
+    messages for the contact as a single combined message.
+    """
+    try:
+        # Wait; this task may be cancelled if a new message arrives
+        await asyncio.sleep(DEBOUNCE_SECONDS)
+    except asyncio.CancelledError:
+        # Task was cancelled because a new message arrived — nothing to do
+        # print(f"🛑 [_debounced_process] Cancelled debounce task for {contact_id}")
+        return
+
+    try:
+        # Pop the buffer and metadata for this contact
+        messages = _pending_messages.pop(contact_id, [])
+        phone = _latest_phone.pop(contact_id, None)
+        ghl_tag = _latest_tag.pop(contact_id, None)
+
+        # clear active task reference
+        _active_tasks.pop(contact_id, None)
+
+        if not messages:
+            print(f"⚠️ [_debounced_process] No messages to process for {contact_id}")
+            return
+
+        # Decide how to combine messages: join with newline (you can change)
+        combined_text = "\n".join(messages)
+        # print(f"🕓 [_debounced_process] Debounce window ended for {contact_id}.")
+        # print(f"📥 [_debounced_process] Messages combined:\n{combined_text}")
+
+        # Call the original AI + send flow
+        await _process_ai_and_send(
+            contact_id, phone, combined_text, ghl_tag, location_id, incoming_channel
+        )
+
+    except Exception as e:
+        # print(f"❌ [_debounced_process] Error while processing {contact_id}: {e}")
+
+        print(traceback.format_exc())
+
+
+# ----- Helper: the AI + send-to-GHL flow (refactored from your original code) -----
+async def _process_ai_and_send(
+    contact_id: str,
+    phone: str,
+    message_text: str,
+    ghl_tag,
+    location_id: str,
+    incoming_channel: str,
+):
+    """
+    Process incoming message, generate AI reply, and send to GHL across all enabled agent channels.
+    """
+    try:
+        if not ghl_tag:
+            return {"status": "ok", "message": "No tag provided"}
+
+        # --- match agent (same as before) ---
+        tags = [t.strip() for t in re.split(r"[,.]", ghl_tag) if t.strip()]
+
+        response = supabase.table("ai_agents").select("*").execute()
+        all_agents = response.data or []
+
+        matching_agents = []
+        for tag in tags:
+            matching_agents = [
+                agent for agent in all_agents if agent.get("data", {}).get("tag") == tag
+            ]
+            if matching_agents:
+                break
+
+        if not matching_agents:
+            return {"status": "ok", "message": "No matching agent found"}
+
+        agent = matching_agents[0]
+
+        # Fetch the last 6 messages for context (3 user + 3 assistant, adjustable)
+        history_resp = (
+            supabase.table("messages")
+            .select("role, content")
+            .eq("contact_id", contact_id)
+            .order("timestamp", desc=True)
+            .limit(6)
+            .execute()
+        )
+        history_data = history_resp.data or []
+        # Reverse so older messages come first
+        history_data = list(reversed(history_data))
+
+        # Prepare AI configuration
+        agent_name = agent.get("name", "AI Assistant")
+        agent_personality = agent.get(
+            "system_prompt", "You are a helpful AI assistant."
+        )
+        agent_intent = agent.get("intent", "Assist the user helpfully.")
+        response_config = agent.get("responseConfig", {}) or {}
+
+        model = response_config.get("model", "gpt-4o-mini")
+        temperature = response_config.get("temperature", 0.7)
+        kb_ids = agent.get("knowledge_base_ids", [])
+
+        # Create embedding for message
+        embedding = await client.embeddings.create(
+            input=message_text,
+            model="text-embedding-3-small",
+            encoding_format="float",
+        )
+        query_vector = embedding.data[0].embedding
+
+        # Query Knowledge Base (same logic)
+        retrieved_docs = []
+        if kb_ids:
+            for kb_id in kb_ids:
+                try:
+                    collection = chroma_client.get_or_create_collection(name=kb_id)
+                    results = collection.query(
+                        query_embeddings=[query_vector], n_results=5
+                    )
+                    if results and results.get("documents"):
+                        docs = results["documents"][0]
+                        retrieved_docs.extend(docs)
+                except Exception as chroma_err:
+                    print(f"❌ [KB] Error querying KB {kb_id}: {str(chroma_err)}")
+        else:
+            print("ℹ️ [KB] No KBs found for this agent — fallback mode")
+
+        # --- Build chat context from Supabase ---
+        history_resp = (
+            supabase.table("messages")
+            .select("role, content")
+            .eq("contact_id", contact_id)
+            .order("timestamp", desc=True)
+            .limit(6)
+            .execute()
+        )
+        history_data = history_resp.data or []
+        chat_history = [
+            {"role": m["role"], "content": m["content"]} for m in reversed(history_data)
+        ]
+
+        # --- Build base system + user prompt ---
+        system_message = {"role": "system", "content": agent_personality}
+
+        if retrieved_docs:
+            # KB context available
+            context = "\n\n".join(retrieved_docs[:10])
+            user_message = {
+                "role": "user",
+                "content": f"""
+        You are {agent_name}.
+        Personality: {agent_personality}
+        Intent: {agent_intent}
+
+        Use the following knowledge base context to reply precisely and factually.
+
+        Context:
+        {context}
+
+        User query:
+        {message_text}
+        """,
+            }
+        else:
+            # No KB context — fallback mode
+            user_message = {
+                "role": "user",
+                "content": f"""
+        You are {agent_name}.
+        Personality: {agent_personality}
+        Intent: {agent_intent}
+
+        User said: {message_text}
+
+        Respond naturally, warmly, and helpfully.
+        """,
+            }
+
+        # --- Generate AI reply with context ---
+        completion = await client.chat.completions.create(
+            model=model,
+            messages=[system_message, *chat_history, user_message],
+            temperature=temperature,
+        )
+        reply = completion.choices[0].message.content
+
+        # --- Save AI reply in Supabase ---
+        supabase.table("messages").insert(
+            {
+                "contact_id": contact_id,
+                "role": "assistant",
+                "content": reply,
+            }
+        ).execute()
+
+        # --- Prepare to send to GHL across enabled channels ---
+
+        # Map your internal channel keys to the GHL 'type' values the API expects.
+        # Adjust mapping if your GHL expects different type strings.
+        CHANNEL_TYPE_MAP = {
+            "whatsapp": "WhatsApp",
+            "sms": "SMS",
+            "email": "Email",
+            "facebook": "Facebook",
+            "instagram": "Instagram",
+            # "web": "Web",
+            # "gmb": "GMB",
+        }
+
+        # Get provider token (same as before)
+        token_response = (
+            supabase.table("provider_data")
+            .select("token")
+            .eq("location_id", location_id)
+            .single()
+            .execute()
+        )
+        provider = token_response.data
+        access_token = provider.get("token") if provider else None
+
+        print("access_token =======> ", access_token)
+
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "Version": "2021-04-15",
+        }
+
+        # Determine channels from agent or fallback to whatsapp
+        # agent_channels = agent.get("channels") or {}
+        # enabled_channel_keys = []
+        # if agent_channels:
+        #     for key, cfg in agent_channels.items():
+        #         try:
+        #             if isinstance(cfg, dict) and cfg.get("enabled"):
+        #                 enabled_channel_keys.append(key)
+        #         except Exception:
+        #             # defensive: if cfg is weird type, skip
+        #             continue
+
+        # fallback behavior: if no enabled channels detected, send via WhatsApp (legacy behavior)
+        # if not enabled_channel_keys:
+        #     enabled_channel_keys = ["whatsapp"]
+
+        send_results = []
+        async with httpx.AsyncClient(timeout=10) as http_client:
+            print("ghl_type =============================> ", incoming_channel)
+            reply_payload = {
+                "contactId": contact_id,
+                "phone": phone,
+                "message": reply,
+                "type": incoming_channel,
+            }
+
+            try:
+                resp = await http_client.post(
+                    GHL_SEND_MESSAGE_ENDPOINT, headers=headers, json=reply_payload
+                )
+                resp.raise_for_status()
+                send_results.append(
+                    {
+                        "channel": incoming_channel,
+                        "status": "sent",
+                        "http_status": resp.status_code,
+                    }
+                )
+                # emit socket for each channel so frontends can react per-channel
+                await sio_server.emit("new_message", reply_payload)
+            except Exception as send_err:
+                # Log error but continue with other channels
+                print(
+                    f"❌ [GHL:{incoming_channel}] Error sending message: {str(send_err)}"
+                )
+                send_results.append(
+                    {
+                        "channel": incoming_channel,
+                        "status": "error",
+                        "error": str(send_err),
+                    }
+                )
+
+        # Return aggregated result so caller can understand what happened across channels
+        return {"status": "ok", "autoReply": reply, "send_results": send_results}
+
+    except Exception as e:
+        print("❌ [_process_ai_and_send] Error:", str(e))
+        return {"status": "error", "message": str(e)}
+

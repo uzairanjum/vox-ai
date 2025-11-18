@@ -1,0 +1,7 @@
+backend/chroma_data
+backend/logs
+backend/chroma_db
+
+frontend/node_modules
+frontend/dist
+

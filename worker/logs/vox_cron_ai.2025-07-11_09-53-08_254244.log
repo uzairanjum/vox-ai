@@ -1,0 +1,8 @@
+2025-07-11 09:53:08 | INFO     | __main__:main:57 - Starting Vox Cron AI application...
+2025-07-11 09:53:08 | INFO     | __main__:check_environment:50 - Using Supabase for database connection
+2025-07-11 09:53:08 | INFO     | __main__:main:69 - Configuration:
+2025-07-11 09:53:08 | INFO     | __main__:main:70 -   Host: 0.0.0.0
+2025-07-11 09:53:08 | INFO     | __main__:main:71 -   Port: 8000
+2025-07-11 09:53:08 | INFO     | __main__:main:72 -   Environment: development
+2025-07-11 09:53:08 | INFO     | __main__:main:73 -   Reload: True
+2025-07-11 09:53:08 | INFO     | __main__:main:74 -   Workers: N/A (reload mode)
