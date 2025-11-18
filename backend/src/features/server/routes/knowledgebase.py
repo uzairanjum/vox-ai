@@ -11,6 +11,8 @@ from pypdf import PdfReader
 from typing import Optional
 import uuid
 
+from src.features.ai.clients.zenrows import ZenRowsConfig
+
 router = APIRouter()
 client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
@@ -137,7 +139,7 @@ async def train_supabase_file(
         text = extract_text_from_pdf(temp_path)
         logger.info(f"Extracted text length: {len(text)} characters")
 
-        splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+        splitter = RecursiveCharacterTextSplitter(chunk_size=1024, chunk_overlap=200)
         chunks = splitter.split_text(text)
         logger.info(f"Split text into {len(chunks)} chunks")
 
@@ -227,22 +229,16 @@ async def add_web_source(body: WebCrawlRequest, authorization: str = Header(...)
         )
 
         # 1. fetch raw HTML
-        async with aiohttp.ClientSession() as session:
-            async with session.get(str(body.url), timeout=10) as resp:
-                resp.raise_for_status()
-                html = await resp.text()
 
-        # 2. strip scripts / styles
-        soup = bs4.BeautifulSoup(html, "html.parser")
-        for tag in soup(["script", "style", "nav", "footer", "header"]):
-            tag.decompose()
-        text = soup.get_text(separator=" ", strip=True)
+       
+        scraped_website = ZenRowsConfig().scrape_website(str(body.url))
+        if not scraped_website:
+            raise HTTPException(status_code=500, detail="Failed to scrape website")
 
-        if not text or len(text) < 50:
-            raise ValueError("Page too small or empty")
+        text = scraped_website.content
 
         # 3. chunk (same splitter you use for files)
-        splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+        splitter = RecursiveCharacterTextSplitter(chunk_size=1024, chunk_overlap=200)
         chunks = splitter.split_text(text)
 
         await emit_progress(
@@ -317,7 +313,7 @@ async def train_faqs(body: FaqTrainingRequest, authorization: str = Header(...))
         docs = [f"Q: {faq['question']}\nA: {faq['answer']}" for faq in body.faqs]
 
         # 2. chunk
-        splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+        splitter = RecursiveCharacterTextSplitter(chunk_size=1024, chunk_overlap=200)
         chunks = []
         for doc in docs:
             chunks.extend(splitter.split_text(doc))

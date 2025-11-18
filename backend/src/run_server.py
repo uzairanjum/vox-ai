@@ -42,20 +42,7 @@ except ImportError:
     logger = logging.getLogger(__name__)
     logger.warning("Using basic logging - enhanced debug features not available")
 
-# Load environment variables
-load_dotenv()
-
-# Check for required environment variables
-required_env_vars = ["OPENAI_API_KEY", "VOYAGE_API_KEY"]
-missing_vars = [var for var in required_env_vars if not os.environ.get(var)]
-if missing_vars:
-    error_message = f"Missing required environment variables: {', '.join(missing_vars)}"
-    logger.error(error_message)
-    logger.error(
-        "Please create a .env file with the required variables or set them in your environment. Server cannot start."
-    )
-    sys.exit(1)  # Exit if critical environment variables are missing
-
+#
 # Initialize FastAPI app
 app = FastAPI(
     title="VOX Backend API",
@@ -238,6 +225,7 @@ def signal_handler(signum: int, frame: Optional[Any]) -> None:
     logger.info("Shutting down server...")
     sys.exit(0)
 
+from src.settings import settings
 
 def run_server() -> None:
     """Run the FastAPI server with proper configuration and signal handling"""
@@ -249,50 +237,29 @@ def run_server() -> None:
         logger.info("Starting FastAPI server")
 
         # Ensure persist directory exists
-        persist_dir = os.environ.get("CHROMA_PERSIST_DIR", "./chroma_db")
-        os.makedirs(persist_dir, exist_ok=True)
-        logger.info(f"CHROMA_PERSIST_DIR is set to: {persist_dir}")
+        os.makedirs(settings.CHROMA_PERSIST_DIR, exist_ok=True)
+        logger.info(f"CHROMA_PERSIST_DIR is sext to: {settings.CHROMA_PERSIST_DIR}")
 
         # Check for potential protobuf issues
-        if not os.environ.get("PROTOBUF_FIXED", ""):
-            logger.warning(
-                "If you encounter protobuf errors, try one of these solutions:"
-            )
-            logger.warning("1. pip install protobuf==3.20.3")
-            logger.warning(
-                "2. Set PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python in your environment"
-            )
-
-        # Get server configuration from environment
-        host = os.environ.get("HOST", "0.0.0.0")
-        port = int(os.environ.get("PORT", "8000"))
-        log_level = os.environ.get("LOG_LEVEL", "info").lower()
+        if not settings.PROTOBUF_FIXED:
+            logger.warning("If you encounter protobuf errors, try one of these solutions:")
+            logger.warning("1. Set PROTOBUF_FIXED=true in your environment")
 
         # Configure uvicorn with performance optimizations
         config = uvicorn.Config(
             app=app,
-            host=host,
-            port=port,
-            log_level=log_level,
-            reload=os.environ.get("DEBUG", "").lower() == "true",
+            host=settings.HOST,
+            port=settings.PORT,
+            log_level=settings.LOG_LEVEL.lower(),
+            reload=settings.DEBUG,
             access_log=True,
-            timeout_keep_alive=int(
-                os.environ.get("KEEP_ALIVE", "30")
-            ),  # Increased for better connection reuse
-            workers=int(
-                os.environ.get("WORKERS", "1")
-            ),  # Can be increased for production
-            limit_concurrency=int(
-                os.environ.get("LIMIT_CONCURRENCY", "1000")
-            ),  # Handle more concurrent requests
-            limit_max_requests=int(
-                os.environ.get("LIMIT_MAX_REQUESTS", "10000")
-            ),  # Higher request limit
-            timeout_graceful_shutdown=int(
-                os.environ.get("GRACEFUL_SHUTDOWN", "30")
-            ),  # Graceful shutdown
-            backlog=2048,  # Increased socket backlog for better handling of concurrent connections
-            loop="asyncio",  # Use asyncio event loop for better performance
+            timeout_keep_alive=settings.KEEP_ALIVE,
+            workers=settings.WORKERS, 
+            limit_concurrency=settings.LIMIT_CONCURRENCY,
+            limit_max_requests=settings.LIMIT_MAX_REQUESTS,
+            timeout_graceful_shutdown=settings.GRACEFUL_SHUTDOWN,
+            backlog=2048,  
+            loop="asyncio", 
         )
 
         server = uvicorn.Server(config)
