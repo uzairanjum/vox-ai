@@ -8,6 +8,7 @@ import sys
 import signal
 from typing import Dict, Any, Optional
 from src.features.server.sockets.sockets import sio_app
+from src.settings import settings
 
 # Set protobuf environment variable early before any imports
 os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
@@ -225,7 +226,7 @@ def signal_handler(signum: int, frame: Optional[Any]) -> None:
     logger.info("Shutting down server...")
     sys.exit(0)
 
-from src.settings import settings
+
 
 def run_server() -> None:
     """Run the FastAPI server with proper configuration and signal handling"""

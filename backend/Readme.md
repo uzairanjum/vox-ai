@@ -6,7 +6,8 @@ source ./.venv/Scripts/activate (window)
 source ./.venv/bin/activate (macos)
 
 # install dependencies
-pip install -r requirements.txt
+pip add poetry
+poetry install
 
 # start application
 uvicorn main:app --port=8080 --reload
