@@ -18,28 +18,25 @@ class Settings(BaseSettings):
 
 
     # OpenAI settings
-    OPENAI_API_KEY: str = os.getenv('OPENAI_API_KEY')
-
+    OPENAI_API_KEY: str = os.getenv('OPENAI_API_KEY', '')
 
     # Voyage AI settings
-    VOYAGE_API_KEY: str = os.getenv('VOYAGE_API_KEY')
+    VOYAGE_API_KEY: str = os.getenv('VOYAGE_API_KEY', '')
 
     # ChromaDB settings
-    # CHROMA_PERSIST_DIR: str = os.getenv('CHROMA_PERSIST_DIR', './chroma_db')
+    CHROMA_PERSIST_DIR: str = os.getenv('CHROMA_PERSIST_DIR', './chroma_data')
 
     # Scraping settings
-    ZENROWS_API_KEY: str = os.getenv('ZENROWS_API_KEY')
+    ZENROWS_API_KEY: str = os.getenv('ZENROWS_API_KEY', '')
 
 
     # ChromaDB persist directory
     PROTOBUF_FIXED: bool = os.getenv('PROTOBUF_FIXED', False)
+    PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION: str = os.getenv('PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION', 'python')
 
-
-    # 
-  
-
-
-
+    # Debug settings
+    DEBUG_LOGS: bool = os.getenv('DEBUG_LOGS', False)
+    LOG_REQUEST_BODY: bool = os.getenv('LOG_REQUEST_BODY', True)
 
     model_config = SettingsConfigDict(env_file=".env")
 
