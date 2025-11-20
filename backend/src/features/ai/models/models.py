@@ -883,3 +883,9 @@ class BulkUpdateResponse(BaseModel):
     totalUpdated: int
     totalFailed: int
     timestamp: datetime
+
+
+class ScrapedWebsite(BaseModel):
+    """Model for scraped website."""
+    content: str
+    url: str
